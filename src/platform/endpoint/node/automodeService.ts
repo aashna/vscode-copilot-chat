@@ -20,7 +20,7 @@ import { IExperimentationService } from '../../telemetry/common/nullExperimentat
 import { ITelemetryService } from '../../telemetry/common/telemetry';
 import { ICAPIClientService } from '../common/capiClient';
 import { AutoChatEndpoint } from './autoChatEndpoint';
-import { RouterDecisionFetcher } from './routerDecisionFetcher';
+import { RouterDecisionFetcher, RoutingContextSignals } from './routerDecisionFetcher';
 
 interface AutoModeAPIResponse {
 	available_models: string[];
@@ -230,21 +230,31 @@ export class AutomodeService extends Disposable implements IAutomodeService {
 				// Router fallback reason isn't set here because we don't want telemetry for this case
 			} else {
 				try {
-					const result = await this._routerDecisionFetcher.getRouterDecision(prompt, token.session_token, token.available_models);
-					if (!result.candidate_models.length) {
+					const contextSignals: RoutingContextSignals = {
+								session_id: conversationId !== 'unknown' ? conversationId : undefined,
+								reference_count: chatRequest?.references?.length,
+								prompt_char_count: prompt.length,
+								previous_model: entry?.endpoint?.model,
+								turn_number: (entry?.turnCount ?? 0) + 1,
+							};
+							const result = await this._routerDecisionFetcher.getRouterDecision(prompt, token.session_token, token.available_models, undefined, contextSignals);
+					if (!result.chosen_model) {
 						routerFallbackReason = 'emptyCandidateList';
 					} else if (entry?.endpoint) {
 						// Prefer a same-provider model from the router's candidate list
 						selectedModel = this._findSameProviderModel(entry.endpoint.modelProvider, result.candidate_models, knownEndpoints);
 					}
 					if (!routerFallbackReason) {
-						selectedModel ??= knownEndpoints.find(e => e.model === result.candidate_models[0]);
+						selectedModel ??= knownEndpoints.find(e => e.model === result.chosen_model);
 					}
 					if (selectedModel) {
 						lastRoutedPrompt = prompt;
 						if (result.sticky_override) {
-							this._logService.trace(`[AutomodeService] Sticky routing override: confidence=${(result.confidence * 100).toFixed(1)}%, label=${result.predicted_label}, router_model=${result.candidate_models[0]}, actual_model=${selectedModel.model}`);
+							this._logService.trace(`[AutomodeService] Sticky routing override: confidence=${(result.confidence * 100).toFixed(1)}%, label=${result.predicted_label}, chosen_model=${result.chosen_model}, actual_model=${selectedModel.model}`);
 						}
+							if (result.hydra_scores) {
+								this._logService.trace(`[AutomodeService] HYDRA scores: reasoning=${result.hydra_scores.reasoning?.toFixed(2)}, code_gen=${result.hydra_scores.code_gen?.toFixed(2)}, debugging=${result.hydra_scores.debugging?.toFixed(2)}, tool_use=${result.hydra_scores.tool_use?.toFixed(2)}, routing_method=${result.routing_method ?? 'binary'}`);
+							}
 					} else {
 						routerFallbackReason = 'noMatchingEndpoint';
 					}
