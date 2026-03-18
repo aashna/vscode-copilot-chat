@@ -141,6 +141,18 @@ export interface IAutomodeService {
 	readonly _serviceBrand: undefined;
 
 	resolveAutoModeEndpoint(chatRequest: ChatRequest | undefined, knownEndpoints: IChatEndpoint[]): Promise<IChatEndpoint>;
+
+	/**
+	 * Called after foreground or background summarization completes.
+	 * Re-runs the router with the summarized text to pick the optimal model
+	 * for the next phase of the conversation. The current model performs the
+	 * summarization (leveraging its warm KV cache), then the router decides
+	 * which model should continue — minimizing wasted cache tokens.
+	 *
+	 * @returns The new endpoint if the router changed the model, or undefined
+	 *          if routing was skipped or the model didn't change.
+	 */
+	notifySummarizationCompleted(conversationId: string, summarizedText: string, source: 'foreground' | 'background', knownEndpoints: IChatEndpoint[]): Promise<IChatEndpoint | undefined>;
 }
 
 export class AutomodeService extends Disposable implements IAutomodeService {
@@ -301,7 +313,109 @@ export class AutomodeService extends Disposable implements IAutomodeService {
 		return autoEndpoint;
 	}
 
-	private _isRouterEnabled(chatRequest: ChatRequest | undefined): boolean {
+	/**
+	 * Re-route after summarization: the current model summarized the conversation,
+	 * now the router classifies the summary text to pick the best model going forward.
+	 * The new model starts fresh with only the small summary context (~1K tokens)
+	 * instead of the full history, so KV cache tokens are correctly attributed.
+	 */
+	async notifySummarizationCompleted(conversationId: string, summarizedText: string, source: 'foreground' | 'background', knownEndpoints: IChatEndpoint[]): Promise<IChatEndpoint | undefined> {
+		if (!knownEndpoints.length) {
+			return undefined;
+		}
+
+		const entry = this._autoModelCache.get(conversationId);
+		if (!entry) {
+			this._logService.trace(`[AutomodeService] notifySummarizationCompleted: no cache entry for conversation=${conversationId}, skipping`);
+			return undefined;
+		}
+
+		if (!summarizedText?.trim().length) {
+			this._logService.trace(`[AutomodeService] notifySummarizationCompleted: empty summary, skipping`);
+			return undefined;
+		}
+
+		const token = await entry.tokenBank.getToken();
+		const previousModel = entry.endpoint.model;
+
+		try {
+			const result = await this._routerDecisionFetcher.getRouterDecision(
+				summarizedText, token.session_token, token.available_models);
+
+			if (!result.candidate_models.length) {
+				this._logService.trace(`[AutomodeService] summarization re-route: no candidates, keeping model=${previousModel}`);
+				return undefined;
+			}
+
+			let newEndpoint = this._findSameProviderModel(
+				entry.endpoint.modelProvider, result.candidate_models, knownEndpoints);
+			newEndpoint ??= knownEndpoints.find(e => e.model === result.candidate_models[0]);
+
+			if (!newEndpoint) {
+				this._logService.trace(`[AutomodeService] summarization re-route: no matching endpoint, keeping model=${previousModel}`);
+				return undefined;
+			}
+
+			const modelChanged = newEndpoint.model !== previousModel;
+			this._logService.trace(`[AutomodeService] Summarization re-route: source=${source}, previous=${previousModel}, new=${newEndpoint.model}, label=${result.predicted_label}, confidence=${(result.confidence * 100).toFixed(1)}%, changed=${modelChanged}`);
+
+			/* __GDPR__
+				"automode.summarizationReroute" : {
+					"owner": "lramos15",
+					"comment": "Reports when the router re-evaluates the model after conversation summarization",
+					"source": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "Whether the summarization was foreground or background" },
+					"previousModel": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The model used before summarization" },
+					"newModel": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The model chosen after summarization" },
+					"predictedLabel": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The router classification for the summarized text" },
+					"modelChanged": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "Whether the model actually changed" },
+					"confidence": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "isMeasurement": true, "comment": "Router confidence for the summarized text" }
+				}
+			*/
+			this._telemetryService.sendMSFTTelemetryEvent('automode.summarizationReroute', {
+				source,
+				previousModel,
+				newModel: newEndpoint.model,
+				predictedLabel: result.predicted_label,
+				modelChanged: String(modelChanged),
+			}, {
+				confidence: result.confidence,
+			});
+
+			if (modelChanged) {
+				const newAutoEndpoint = this._instantiationService.createInstance(
+					AutoChatEndpoint, newEndpoint, token.session_token,
+					token.discounted_costs?.[newEndpoint.model] || 0,
+					this._calculateDiscountRange(token.discounted_costs));
+
+				this._autoModelCache.set(conversationId, {
+					...entry,
+					endpoint: newAutoEndpoint,
+					lastSessionToken: token.session_token,
+				});
+
+				return newAutoEndpoint;
+			}
+
+			return undefined;
+		} catch (e) {
+			this._logService.error(`[AutomodeService] Failed to re-route after summarization for ${conversationId}:`, (e as Error).message);
+			/* __GDPR__
+				"automode.summarizationRerouteError" : {
+					"owner": "lramos15",
+					"comment": "Reports when the router fails to re-evaluate after summarization",
+					"source": { "classification": "SystemMetaData", "purpose": "PerformanceAndHealth", "comment": "Foreground or background" },
+					"error": { "classification": "CallstackOrException", "purpose": "PerformanceAndHealth", "comment": "The error message" }
+				}
+			*/
+			this._telemetryService.sendMSFTTelemetryEvent('automode.summarizationRerouteError', {
+				source,
+				error: (e as Error).message,
+			});
+			return undefined;
+		}
+	}
+
+		private _isRouterEnabled(chatRequest: ChatRequest | undefined): boolean {
 		const isPanelChat = !chatRequest?.location || chatRequest?.location === ChatLocation.Panel;
 		return isPanelChat && this._configurationService.getExperimentBasedConfig(ConfigKey.TeamInternal.UseAutoModeRouting, this._expService);
 	}

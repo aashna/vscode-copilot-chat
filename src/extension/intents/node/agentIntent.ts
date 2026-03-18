@@ -11,6 +11,7 @@ import { IChatSessionService } from '../../../platform/chat/common/chatSessionSe
 import { ChatLocation, ChatResponse } from '../../../platform/chat/common/commonTypes';
 import { ConfigKey, IConfigurationService } from '../../../platform/configuration/common/configurationService';
 import { isAnthropicFamily, isGptFamily, modelCanUseApplyPatchExclusively, modelCanUseReplaceStringExclusively, modelSupportsApplyPatch, modelSupportsMultiReplaceString, modelSupportsReplaceString, modelSupportsSimplifiedApplyPatchInstructions } from '../../../platform/endpoint/common/chatModelCapabilities';
+import { IAutomodeService } from '../../../platform/endpoint/node/automodeService';
 import { IEndpointProvider } from '../../../platform/endpoint/common/endpointProvider';
 import { IEnvService } from '../../../platform/env/common/envService';
 import { ILogService } from '../../../platform/log/common/logService';
@@ -353,6 +354,7 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 		@INotebookService notebookService: INotebookService,
 		@ILogService private readonly logService: ILogService,
 		@IExperimentationService private readonly expService: IExperimentationService,
+		@IAutomodeService private readonly automodeService: IAutomodeService,
 	) {
 		super(intent, location, endpoint, request, intentOptions, instantiationService, codeMapperService, envService, promptPathRepresentationService, endpointProvider, workspaceService, toolsService, configurationService, editLogService, commandService, telemetryService, notebookService);
 	}
@@ -570,6 +572,18 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 						this._persistSummaryOnTurn(bgResult, promptContext, contextLengthBefore);
 						this._sendBackgroundCompactionTelemetry(budgetExceededTrigger, 'applied', contextRatio, promptContext);
 						summaryAppliedThisIteration = true;
+
+						// Re-route after background summarization
+						if (bgResult.summary) {
+							const convId = promptContext.conversation?.sessionResource?.toString()
+								?? promptContext.conversation?.sessionId ?? 'unknown';
+							const newEp = await this.automodeService.notifySummarizationCompleted(
+								convId, bgResult.summary, 'background', []);
+							if (newEp) {
+								this.logService.debug(`[Agent] BG summarization re-route: ${endpoint.model} -> ${newEp.model}`);
+							}
+						}
+
 						// Re-render with the compacted history
 						const renderer = PromptRenderer.create(this.instantiationService, endpoint, this.prompt, { ...props, promptContext });
 						result = await renderer.render(progress, token);
@@ -610,6 +624,17 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 					contextLengthBefore,
 				},
 			));
+
+			// Re-route after foreground summarization
+			if (summaryMeta.text) {
+				const convId = promptContext.conversation?.sessionResource?.toString()
+					?? promptContext.conversation?.sessionId ?? 'unknown';
+				const newEndpoint = await this.automodeService.notifySummarizationCompleted(
+					convId, summaryMeta.text, 'foreground', []);
+				if (newEndpoint) {
+					this.logService.debug(`[Agent] Foreground summarization re-route: ${endpoint.model} -> ${newEndpoint.model}`);
+				}
+			}
 		}
 
 		// 3. Post-render background compaction checks.
@@ -635,6 +660,18 @@ export class AgentIntentInvocation extends EditCodeIntentInvocation implements I
 					this._applySummaryToRounds(bgResult, promptContext);
 					this._persistSummaryOnTurn(bgResult, promptContext, result.tokenCount);
 					this._sendBackgroundCompactionTelemetry('postRenderBlocked', 'applied', postRenderRatio, promptContext);
+
+					// Re-route after post-render background summarization
+					if (bgResult.summary) {
+						const convId = promptContext.conversation?.sessionResource?.toString()
+							?? promptContext.conversation?.sessionId ?? 'unknown';
+						const newEp = await this.automodeService.notifySummarizationCompleted(
+							convId, bgResult.summary, 'background', []);
+						if (newEp) {
+							this.logService.debug(`[Agent] Post-render BG re-route: ${endpoint.model} -> ${newEp.model}`);
+						}
+					}
+
 					// Re-render with compacted history so the LLM receives the smaller prompt
 					const reRenderer = PromptRenderer.create(this.instantiationService, endpoint, this.prompt, { ...props, promptContext });
 					result = await reRenderer.render(progress, token);
