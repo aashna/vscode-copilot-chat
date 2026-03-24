@@ -48,11 +48,14 @@ export class RouterDecisionFetcher {
 	) {
 	}
 
-	async getRouterDecision(query: string, autoModeToken: string, availableModels: string[], stickyThreshold?: number, contextSignals?: RoutingContextSignals): Promise<RouterDecisionResponse> {
+	async getRouterDecision(query: string, autoModeToken: string, availableModels: string[], stickyThreshold?: number, contextSignals?: RoutingContextSignals, maxTokenLength?: number): Promise<RouterDecisionResponse> {
 		const startTime = Date.now();
 		const requestBody: Record<string, unknown> = { prompt: query, available_models: availableModels, ...contextSignals };
 		if (stickyThreshold !== undefined) {
 			requestBody.sticky_threshold = stickyThreshold;
+		}
+		if (maxTokenLength !== undefined) {
+			requestBody.max_token_length = maxTokenLength;
 		}
 		const response = await this._capiClientService.makeRequest<Response>({
 			method: 'POST',
