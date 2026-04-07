@@ -887,4 +887,245 @@ describe('AutomodeService', () => {
 			);
 		});
 	});
+
+	describe('routing_method experiment', () => {
+		function mockRouterResponseWithCapture(available_models: string[], routerResult: Record<string, unknown>, session_token = 'test-token') {
+			let capturedBody: string | undefined;
+			(mockCAPIClientService.makeRequest as ReturnType<typeof vi.fn>).mockImplementation((req: any, opts: any) => {
+				if (opts?.type === RequestType.ModelRouter) {
+					capturedBody = req.body;
+					return Promise.resolve({
+						ok: true,
+						text: vi.fn().mockResolvedValue(JSON.stringify({
+							predicted_label: 'needs_reasoning',
+							confidence: 0.9,
+							latency_ms: 30,
+							candidate_models: ['gpt-4o'],
+							chosen_model: 'gpt-4o',
+							scores: { needs_reasoning: 0.9, no_reasoning: 0.1 },
+							sticky_override: false,
+							...routerResult,
+						}))
+					});
+				}
+				return Promise.resolve({
+					ok: true,
+					json: vi.fn().mockResolvedValue({
+						available_models,
+						expires_at: Math.floor(Date.now() / 1000) + 3600,
+						session_token,
+					})
+				});
+			});
+			return { getCapturedBody: () => capturedBody };
+		}
+
+		it('should send routing_method in request body when AutoModeRoutingMethod is set', async () => {
+			enableRouter();
+			(configurationService as InMemoryConfigurationService).setConfig(
+				ConfigKey.TeamInternal.AutoModeRoutingMethod, 'hydra'
+			);
+			const gpt4oEndpoint = createEndpoint('gpt-4o', 'OpenAI');
+			const { getCapturedBody } = mockRouterResponseWithCapture(['gpt-4o'], {});
+
+			automodeService = createService();
+			const chatRequest: Partial<ChatRequest> = {
+				location: ChatLocation.Panel,
+				prompt: 'test prompt',
+				sessionId: 'session-routing-method-hydra',
+			};
+
+			await automodeService.resolveAutoModeEndpoint(chatRequest as ChatRequest, [gpt4oEndpoint]);
+
+			const body = JSON.parse(getCapturedBody()!);
+			expect(body.routing_method).toBe('hydra');
+		});
+
+		it('should send routing_method=binary when configured', async () => {
+			enableRouter();
+			(configurationService as InMemoryConfigurationService).setConfig(
+				ConfigKey.TeamInternal.AutoModeRoutingMethod, 'binary'
+			);
+			const gpt4oEndpoint = createEndpoint('gpt-4o', 'OpenAI');
+			const { getCapturedBody } = mockRouterResponseWithCapture(['gpt-4o'], {});
+
+			automodeService = createService();
+			const chatRequest: Partial<ChatRequest> = {
+				location: ChatLocation.Panel,
+				prompt: 'test prompt',
+				sessionId: 'session-routing-method-binary',
+			};
+
+			await automodeService.resolveAutoModeEndpoint(chatRequest as ChatRequest, [gpt4oEndpoint]);
+
+			const body = JSON.parse(getCapturedBody()!);
+			expect(body.routing_method).toBe('binary');
+		});
+
+		it('should not send routing_method when AutoModeRoutingMethod is empty (path A)', async () => {
+			enableRouter();
+			// AutoModeRoutingMethod defaults to '' — do NOT set it
+			const gpt4oEndpoint = createEndpoint('gpt-4o', 'OpenAI');
+			const { getCapturedBody } = mockRouterResponseWithCapture(['gpt-4o'], {});
+
+			automodeService = createService();
+			const chatRequest: Partial<ChatRequest> = {
+				location: ChatLocation.Panel,
+				prompt: 'test prompt',
+				sessionId: 'session-routing-method-default',
+			};
+
+			await automodeService.resolveAutoModeEndpoint(chatRequest as ChatRequest, [gpt4oEndpoint]);
+
+			const body = JSON.parse(getCapturedBody()!);
+			expect(body.routing_method).toBeUndefined();
+		});
+
+		it('should fall back to default model when router responds with fallback=true', async () => {
+			enableRouter();
+			(configurationService as InMemoryConfigurationService).setConfig(
+				ConfigKey.TeamInternal.AutoModeRoutingMethod, 'hydra'
+			);
+			const gpt4oEndpoint = createEndpoint('gpt-4o', 'OpenAI');
+			const claudeEndpoint = createEndpoint('claude-sonnet', 'Anthropic');
+
+			(mockCAPIClientService.makeRequest as ReturnType<typeof vi.fn>).mockImplementation((_body: any, opts: any) => {
+				if (opts?.type === RequestType.ModelRouter) {
+					return Promise.resolve({
+						ok: true,
+						text: vi.fn().mockResolvedValue(JSON.stringify({
+							predicted_label: 'fallback',
+							confidence: 0,
+							latency_ms: 15,
+							candidate_models: [],
+							scores: { needs_reasoning: 0, no_reasoning: 0 },
+							routing_method: 'hydra',
+							fallback: true,
+							fallback_reason: 'model_not_available',
+						}))
+					});
+				}
+				return Promise.resolve({
+					ok: true,
+					json: vi.fn().mockResolvedValue({
+						available_models: ['claude-sonnet', 'gpt-4o'],
+						expires_at: Math.floor(Date.now() / 1000) + 3600,
+						session_token: 'test-token',
+					})
+				});
+			});
+
+			automodeService = createService();
+			const chatRequest: Partial<ChatRequest> = {
+				location: ChatLocation.Panel,
+				prompt: 'test prompt',
+				sessionId: 'session-hydra-fallback',
+			};
+
+			const result = await automodeService.resolveAutoModeEndpoint(chatRequest as ChatRequest, [claudeEndpoint, gpt4oEndpoint]);
+			// Should fall back to default selection (first available = claude-sonnet)
+			expect(result.model).toBe('claude-sonnet');
+		});
+
+		it('should log fallback reason and routing_method when router signals fallback', async () => {
+			enableRouter();
+			(configurationService as InMemoryConfigurationService).setConfig(
+				ConfigKey.TeamInternal.AutoModeRoutingMethod, 'hydra'
+			);
+			const gpt4oEndpoint = createEndpoint('gpt-4o', 'OpenAI');
+
+			(mockCAPIClientService.makeRequest as ReturnType<typeof vi.fn>).mockImplementation((_body: any, opts: any) => {
+				if (opts?.type === RequestType.ModelRouter) {
+					return Promise.resolve({
+						ok: true,
+						text: vi.fn().mockResolvedValue(JSON.stringify({
+							predicted_label: 'fallback',
+							confidence: 0,
+							latency_ms: 10,
+							candidate_models: [],
+							scores: { needs_reasoning: 0, no_reasoning: 0 },
+							routing_method: 'hydra',
+							fallback: true,
+							fallback_reason: 'no_capability_match',
+						}))
+					});
+				}
+				return Promise.resolve({
+					ok: true,
+					json: vi.fn().mockResolvedValue({
+						available_models: ['gpt-4o'],
+						expires_at: Math.floor(Date.now() / 1000) + 3600,
+						session_token: 'test-token',
+					})
+				});
+			});
+
+			automodeService = createService();
+			const chatRequest: Partial<ChatRequest> = {
+				location: ChatLocation.Panel,
+				prompt: 'test prompt',
+				sessionId: 'session-hydra-fallback-log',
+			};
+
+			await automodeService.resolveAutoModeEndpoint(chatRequest as ChatRequest, [gpt4oEndpoint]);
+
+			expect(mockLogService.info).toHaveBeenCalledWith(
+				expect.stringContaining('Router signaled fallback')
+			);
+			expect(mockLogService.info).toHaveBeenCalledWith(
+				expect.stringContaining('no_capability_match')
+			);
+			expect(mockLogService.info).toHaveBeenCalledWith(
+				expect.stringContaining('routing_method=hydra')
+			);
+		});
+
+		it('should use router result normally when fallback is false', async () => {
+			enableRouter();
+			(configurationService as InMemoryConfigurationService).setConfig(
+				ConfigKey.TeamInternal.AutoModeRoutingMethod, 'hydra'
+			);
+			const gpt4oEndpoint = createEndpoint('gpt-4o', 'OpenAI');
+			const claudeEndpoint = createEndpoint('claude-sonnet', 'Anthropic');
+
+			(mockCAPIClientService.makeRequest as ReturnType<typeof vi.fn>).mockImplementation((_body: any, opts: any) => {
+				if (opts?.type === RequestType.ModelRouter) {
+					return Promise.resolve({
+						ok: true,
+						text: vi.fn().mockResolvedValue(JSON.stringify({
+							predicted_label: 'needs_reasoning',
+							confidence: 0.95,
+							latency_ms: 25,
+							candidate_models: ['claude-sonnet'],
+							chosen_model: 'claude-sonnet',
+							scores: { needs_reasoning: 0.95, no_reasoning: 0.05 },
+							routing_method: 'hydra',
+							fallback: false,
+							hydra_scores: { 'claude-sonnet': 0.95, 'gpt-4o': 0.8 },
+							chosen_shortfall: 0.02,
+						}))
+					});
+				}
+				return Promise.resolve({
+					ok: true,
+					json: vi.fn().mockResolvedValue({
+						available_models: ['gpt-4o', 'claude-sonnet'],
+						expires_at: Math.floor(Date.now() / 1000) + 3600,
+						session_token: 'test-token',
+					})
+				});
+			});
+
+			automodeService = createService();
+			const chatRequest: Partial<ChatRequest> = {
+				location: ChatLocation.Panel,
+				prompt: 'explain quantum computing',
+				sessionId: 'session-hydra-normal',
+			};
+
+			const result = await automodeService.resolveAutoModeEndpoint(chatRequest as ChatRequest, [gpt4oEndpoint, claudeEndpoint]);
+			// Router picked claude-sonnet via hydra, should be used
+			expect(result.model).toBe('claude-sonnet');
+		});
+	});
 });

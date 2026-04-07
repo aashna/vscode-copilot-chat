@@ -60,6 +60,9 @@ export class RouterDecisionFetcher {
 		if (stickyThreshold !== undefined) {
 			requestBody.sticky_threshold = stickyThreshold;
 		}
+		if (routingMethod) {
+			requestBody.routing_method = routingMethod;
+		}
 		const copilotToken = (await this._authService.getCopilotToken()).token;
 		const abortController = new AbortController();
 		const timeout = setTimeout(() => abortController.abort(), 1000);
